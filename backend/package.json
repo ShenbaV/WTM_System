@@ -3,12 +3,17 @@
   "version": "1.0.0",
   "description": "Wallet & Transaction Management System - Backend",
   "main": "dist/server.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
     "migrate": "ts-node-dev --transpile-only --no-notify --respawn=false src/scripts/migrate.ts",
     "migrate:revert": "ts-node-dev --transpile-only --no-notify --respawn=false src/scripts/migrate.ts --revert",
+    "migrate:prod": "node dist/scripts/migrate.js",
+    "migrate:prod:revert": "node dist/scripts/migrate.js --revert",
     "lint": "eslint . --ext .ts"
   },
   "keywords": ["wallet", "transactions", "express", "typescript", "typeorm"],
