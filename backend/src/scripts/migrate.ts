@@ -1,37 +1,47 @@
-import fs from 'fs';
-import path from 'path';
-import { pool } from '../config/db';
+import 'reflect-metadata';
+import { AppDataSource } from '../config/data-source';
 
 /**
- * Runs the schema.sql file against the configured DATABASE_URL.
- * The schema uses IF NOT EXISTS guards, so it is safe to re-run.
+ * Runs TypeORM migrations against the configured DATABASE_URL.
+ * Pass `--revert` to roll back the most recently applied migration.
+ *
+ * Examples:
+ *   npm run migrate
+ *   npm run migrate:revert
  */
-async function migrate() {
-    const schemaPath = path.resolve(__dirname, '..', '..', 'db', 'schema.sql');
-    if (!fs.existsSync(schemaPath)) {
-        throw new Error(`Schema file not found at ${schemaPath}`);
-    }
-    const sql = fs.readFileSync(schemaPath, 'utf8');
+async function main() {
+    const revert = process.argv.includes('--revert');
 
-    console.log(`Applying schema from ${schemaPath}`);
-    const client = await pool.connect();
+    await AppDataSource.initialize();
     try {
-        await client.query('BEGIN');
-        await client.query(sql);
-        await client.query('COMMIT');
-        console.log('Migration applied successfully.');
-    } catch (err) {
-        await client.query('ROLLBACK').catch(() => undefined);
-        throw err;
+        if (revert) {
+            console.log('Reverting last migration...');
+            await AppDataSource.undoLastMigration({ transaction: 'all' });
+            console.log('Last migration reverted.');
+            return;
+        }
+
+        const pending = await AppDataSource.showMigrations();
+        if (!pending) {
+            console.log('Database is already up to date — no pending migrations.');
+            return;
+        }
+
+        const applied = await AppDataSource.runMigrations({ transaction: 'all' });
+        if (applied.length === 0) {
+            console.log('No migrations were applied.');
+        } else {
+            console.log(`Applied ${applied.length} migration(s):`);
+            for (const m of applied) console.log(' -', m.name);
+        }
     } finally {
-        client.release();
+        await AppDataSource.destroy();
     }
 }
 
-migrate()
-    .then(() => pool.end())
+main()
     .then(() => process.exit(0))
     .catch((err) => {
         console.error('Migration failed:', err);
-        pool.end().finally(() => process.exit(1));
+        process.exit(1);
     });

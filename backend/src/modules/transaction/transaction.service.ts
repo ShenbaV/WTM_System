@@ -1,28 +1,28 @@
-import { pool } from '../../config/db';
+import { AppDataSource } from '../../config/data-source';
+import { Transaction } from '../../entities/Transaction.entity';
+import { Wallet } from '../../entities/Wallet.entity';
 import { ApiError } from '../../utils/ApiError';
 import { fromMinorUnits } from '../../utils/money';
-import { TransactionDto, TransactionRow } from './transaction.types';
+import { TransactionDto } from './transaction.types';
 import { ListTransactionsInput } from './transaction.validation';
 
-function toDto(row: TransactionRow, viewerWalletId: string): TransactionDto {
+function toDto(t: Transaction, viewerWalletId: string): TransactionDto {
     const direction: 'CREDIT' | 'DEBIT' =
-        row.receiver_wallet_id === viewerWalletId ? 'CREDIT' : 'DEBIT';
+        t.receiverWalletId === viewerWalletId ? 'CREDIT' : 'DEBIT';
+    const senderUser = t.senderWallet?.user ?? null;
+    const receiverUser = t.receiverWallet?.user ?? null;
 
     return {
-        id: row.id,
-        type: row.type,
-        status: row.status,
-        amount: fromMinorUnits(row.amount),
-        amountMinor: row.amount,
-        description: row.description,
-        createdAt: row.created_at,
+        id: t.id,
+        type: t.type,
+        status: t.status,
+        amount: fromMinorUnits(t.amount),
+        amountMinor: t.amount,
+        description: t.description,
+        createdAt: t.createdAt.toISOString(),
         direction,
-        sender: row.sender_name && row.sender_email
-            ? { name: row.sender_name, email: row.sender_email }
-            : null,
-        receiver: row.receiver_name && row.receiver_email
-            ? { name: row.receiver_name, email: row.receiver_email }
-            : null,
+        sender: senderUser ? { name: senderUser.name, email: senderUser.email } : null,
+        receiver: receiverUser ? { name: receiverUser.name, email: receiverUser.email } : null,
     };
 }
 
@@ -31,50 +31,35 @@ export const transactionService = {
         userId: string,
         opts: ListTransactionsInput
     ): Promise<{ transactions: TransactionDto[]; total: number }> {
-        const walletRes = await pool.query<{ id: string }>(
-            'SELECT id FROM wallets WHERE user_id = $1',
-            [userId]
-        );
-        const walletId = walletRes.rows[0]?.id;
-        if (!walletId) {
+        const walletRepo = AppDataSource.getRepository(Wallet);
+        const wallet = await walletRepo.findOne({
+            where: { userId },
+            select: { id: true },
+        });
+        if (!wallet) {
             throw ApiError.notFound('Wallet not found');
         }
 
-        const totalRes = await pool.query<{ count: string }>(
-            `SELECT COUNT(*)::text AS count
-             FROM transactions
-             WHERE sender_wallet_id = $1 OR receiver_wallet_id = $1`,
-            [walletId]
-        );
-        const total = Number(totalRes.rows[0]?.count ?? '0');
-
-        const rowsRes = await pool.query<TransactionRow>(
-            `SELECT
-                t.id,
-                t.sender_wallet_id,
-                t.receiver_wallet_id,
-                t.type,
-                t.amount,
-                t.status,
-                t.description,
-                t.created_at,
-                su.name  AS sender_name,
-                su.email AS sender_email,
-                ru.name  AS receiver_name,
-                ru.email AS receiver_email
-             FROM transactions t
-             LEFT JOIN wallets sw ON sw.id = t.sender_wallet_id
-             LEFT JOIN users   su ON su.id = sw.user_id
-             LEFT JOIN wallets rw ON rw.id = t.receiver_wallet_id
-             LEFT JOIN users   ru ON ru.id = rw.user_id
-             WHERE t.sender_wallet_id = $1 OR t.receiver_wallet_id = $1
-             ORDER BY t.created_at DESC
-             LIMIT $2 OFFSET $3`,
-            [walletId, opts.limit, opts.offset]
-        );
+        const txRepo = AppDataSource.getRepository(Transaction);
+        // Use entity property names (camelCase) — TypeORM translates them
+        // to the underlying snake_case columns. Mixing raw column names with
+        // skip()/take() + JOINs causes TypeORM's DISTINCT subquery to drop
+        // the predicate and return zero rows.
+        const [rows, total] = await txRepo
+            .createQueryBuilder('t')
+            .leftJoinAndSelect('t.senderWallet', 'sw')
+            .leftJoinAndSelect('sw.user', 'su')
+            .leftJoinAndSelect('t.receiverWallet', 'rw')
+            .leftJoinAndSelect('rw.user', 'ru')
+            .where('t.senderWalletId = :walletId', { walletId: wallet.id })
+            .orWhere('t.receiverWalletId = :walletId', { walletId: wallet.id })
+            .orderBy('t.createdAt', 'DESC')
+            .skip(opts.offset)
+            .take(opts.limit)
+            .getManyAndCount();
 
         return {
-            transactions: rowsRes.rows.map((r) => toDto(r, walletId)),
+            transactions: rows.map((row: Transaction) => toDto(row, wallet.id)),
             total,
         };
     },

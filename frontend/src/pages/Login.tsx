@@ -1,13 +1,22 @@
 import { useState } from 'react';
-import { Box, Button, Link as MuiLink, Stack, TextField, Typography } from '@mui/material';
-import { Link as RouterLink } from 'react-router-dom';
+import {
+    Alert,
+    Box,
+    Button,
+    CircularProgress,
+    Stack,
+    TextField,
+    Typography,
+} from '@mui/material';
 import { useLogin } from '../hooks/useAuth';
+import PasswordField from '../components/PasswordField';
+import { extractErrorMessage } from '../services/api';
 
 export default function Login() {
     const [email, setEmail] = useState('');
     const [password, setPassword] = useState('');
     const [errors, setErrors] = useState<{ email?: string; password?: string }>({});
-    const { mutate, isPending } = useLogin();
+    const { mutate, isPending, error, reset } = useLogin();
 
     const validate = () => {
         const e: typeof errors = {};
@@ -20,35 +29,46 @@ export default function Login() {
 
     const onSubmit = (e: React.FormEvent) => {
         e.preventDefault();
+        reset();
         if (!validate()) return;
         mutate({ email: email.trim(), password });
     };
 
     return (
         <Box>
-            <Typography variant="h5" fontWeight={700} gutterBottom>
-                Sign in
-            </Typography>
             <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
-                Welcome back. Enter your details below.
+                Welcome back — sign in to access your wallet.
             </Typography>
+
+            {error && (
+                <Alert severity="error" sx={{ mb: 2 }} onClose={reset}>
+                    {extractErrorMessage(error, 'Sign in failed')}
+                </Alert>
+            )}
+
             <form onSubmit={onSubmit} noValidate>
                 <Stack spacing={2}>
                     <TextField
                         label="Email"
                         type="email"
                         value={email}
-                        onChange={(e) => setEmail(e.target.value)}
+                        onChange={(e) => {
+                            setEmail(e.target.value);
+                            if (errors.email) setErrors((p) => ({ ...p, email: undefined }));
+                        }}
                         error={Boolean(errors.email)}
                         helperText={errors.email}
                         autoComplete="email"
+                        autoFocus
                         fullWidth
                     />
-                    <TextField
+                    <PasswordField
                         label="Password"
-                        type="password"
                         value={password}
-                        onChange={(e) => setPassword(e.target.value)}
+                        onChange={(e) => {
+                            setPassword(e.target.value);
+                            if (errors.password) setErrors((p) => ({ ...p, password: undefined }));
+                        }}
                         error={Boolean(errors.password)}
                         helperText={errors.password}
                         autoComplete="current-password"
@@ -59,17 +79,15 @@ export default function Login() {
                         variant="contained"
                         size="large"
                         disabled={isPending}
+                        startIcon={
+                            isPending ? <CircularProgress size={18} color="inherit" /> : undefined
+                        }
                     >
                         {isPending ? 'Signing in…' : 'Sign in'}
                     </Button>
                 </Stack>
             </form>
-            <Typography variant="body2" sx={{ mt: 3, textAlign: 'center' }}>
-                Don&apos;t have an account?{' '}
-                <MuiLink component={RouterLink} to="/register">
-                    Create one
-                </MuiLink>
-            </Typography>
+
         </Box>
     );
 }

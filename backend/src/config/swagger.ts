@@ -30,6 +30,7 @@ export const swaggerSpec = swaggerJsdoc({
         },
         tags: [
             { name: 'Auth' },
+            { name: 'Users' },
             { name: 'Wallet' },
             { name: 'Transactions' },
         ],

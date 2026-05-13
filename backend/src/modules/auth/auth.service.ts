@@ -1,51 +1,54 @@
 import bcrypt from 'bcrypt';
-import { withTransaction } from '../../config/db';
+import { AppDataSource, withTransaction } from '../../config/data-source';
+import { User } from '../../entities/User.entity';
+import { Wallet } from '../../entities/Wallet.entity';
 import { ApiError } from '../../utils/ApiError';
 import { signToken } from '../../utils/jwt';
-import { AuthResponse, PublicUser, UserRow } from './auth.types';
+import { AuthResponse, PublicUser } from './auth.types';
 import { LoginInput, RegisterInput } from './auth.validation';
 
 const SALT_ROUNDS = 10;
 
-function toPublicUser(row: UserRow): PublicUser {
+function toPublicUser(user: User): PublicUser {
     return {
-        id: row.id,
-        name: row.name,
-        email: row.email,
-        createdAt: row.created_at,
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        createdAt: user.createdAt.toISOString(),
     };
 }
 
 export const authService = {
     async register(input: RegisterInput): Promise<AuthResponse> {
-        const { name, email, password } = input;
-        const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
+        const passwordHash = await bcrypt.hash(input.password, SALT_ROUNDS);
 
-        // We create the user AND their wallet inside a single DB transaction so
-        // a user never exists without a wallet.
-        const user = await withTransaction(async (client) => {
-            const existing = await client.query<UserRow>(
-                'SELECT id FROM users WHERE email = $1',
-                [email]
-            );
-            if (existing.rowCount && existing.rowCount > 0) {
+        // A user must never exist without a wallet — create both atomically.
+        const user = await withTransaction(async (qr) => {
+            const userRepo = qr.manager.getRepository(User);
+            const walletRepo = qr.manager.getRepository(Wallet);
+
+            const existing = await userRepo.findOne({
+                where: { email: input.email },
+                select: { id: true },
+            });
+            if (existing) {
                 throw ApiError.conflict('Email is already registered');
             }
 
-            const inserted = await client.query<UserRow>(
-                `INSERT INTO users (name, email, password_hash)
-                 VALUES ($1, $2, $3)
-                 RETURNING id, name, email, password_hash, created_at`,
-                [name, email, passwordHash]
-            );
-            const userRow = inserted.rows[0];
+            const newUser = userRepo.create({
+                name: input.name,
+                email: input.email,
+                passwordHash,
+            });
+            await userRepo.save(newUser);
 
-            await client.query(
-                'INSERT INTO wallets (user_id, balance) VALUES ($1, 0)',
-                [userRow.id]
-            );
+            const wallet = walletRepo.create({
+                userId: newUser.id,
+                balance: '0',
+            });
+            await walletRepo.save(wallet);
 
-            return userRow;
+            return newUser;
         });
 
         const token = signToken({ id: user.id, email: user.email });
@@ -53,22 +56,14 @@ export const authService = {
     },
 
     async login(input: LoginInput): Promise<AuthResponse> {
-        const { email, password } = input;
-        const result = await withTransaction(async (client) => {
-            return client.query<UserRow>(
-                `SELECT id, name, email, password_hash, created_at
-                 FROM users WHERE email = $1`,
-                [email]
-            );
-        });
-
-        const user = result.rows[0];
+        const userRepo = AppDataSource.getRepository(User);
+        const user = await userRepo.findOne({ where: { email: input.email } });
         if (!user) {
             throw ApiError.unauthorized('Invalid credentials');
         }
 
-        const ok = await bcrypt.compare(password, user.password_hash);
-        if (!ok) {
+        const valid = await bcrypt.compare(input.password, user.passwordHash);
+        if (!valid) {
             throw ApiError.unauthorized('Invalid credentials');
         }
 

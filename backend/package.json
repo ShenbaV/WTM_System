@@ -8,9 +8,10 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "migrate": "ts-node-dev --transpile-only --no-notify --respawn=false src/scripts/migrate.ts",
+    "migrate:revert": "ts-node-dev --transpile-only --no-notify --respawn=false src/scripts/migrate.ts --revert",
     "lint": "eslint . --ext .ts"
   },
-  "keywords": ["wallet", "transactions", "express", "typescript"],
+  "keywords": ["wallet", "transactions", "express", "typescript", "typeorm"],
   "author": "",
   "license": "MIT",
   "dependencies": {
@@ -22,8 +23,10 @@
     "jsonwebtoken": "^9.0.2",
     "morgan": "^1.10.0",
     "pg": "^8.12.0",
+    "reflect-metadata": "^0.2.2",
     "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.1",
+    "typeorm": "^0.3.20",
     "zod": "^3.23.8"
   },
   "devDependencies": {

@@ -1,27 +1,26 @@
-import { pool, withTransaction } from '../../config/db';
+import { AppDataSource, withTransaction } from '../../config/data-source';
+import { User } from '../../entities/User.entity';
+import { Wallet } from '../../entities/Wallet.entity';
+import { Transaction } from '../../entities/Transaction.entity';
 import { ApiError } from '../../utils/ApiError';
 import { fromMinorUnits, toMinorUnits } from '../../utils/money';
 import { AddMoneyInput, TransferInput } from './wallet.validation';
-import { TransferResultDto, WalletDto, WalletRow } from './wallet.types';
+import { TransferResultDto, WalletDto } from './wallet.types';
 
-function toWalletDto(row: WalletRow): WalletDto {
+function toWalletDto(wallet: Wallet): WalletDto {
     return {
-        id: row.id,
-        userId: row.user_id,
-        balance: fromMinorUnits(row.balance),
-        balanceMinor: row.balance,
-        createdAt: row.created_at,
+        id: wallet.id,
+        userId: wallet.userId,
+        balance: fromMinorUnits(wallet.balance),
+        balanceMinor: wallet.balance,
+        createdAt: wallet.createdAt.toISOString(),
     };
 }
 
 export const walletService = {
     async getWalletByUser(userId: string): Promise<WalletDto> {
-        const { rows } = await pool.query<WalletRow>(
-            `SELECT id, user_id, balance, created_at
-             FROM wallets WHERE user_id = $1`,
-            [userId]
-        );
-        const wallet = rows[0];
+        const walletRepo = AppDataSource.getRepository(Wallet);
+        const wallet = await walletRepo.findOne({ where: { userId } });
         if (!wallet) {
             throw ApiError.notFound('Wallet not found');
         }
@@ -29,40 +28,39 @@ export const walletService = {
     },
 
     /**
-     * Add money (DEPOSIT) is a single-wallet update, but we still run it inside
-     * a transaction with FOR UPDATE row locking so concurrent deposits/transfers
-     * can't race against each other.
+     * Deposit money. Although a deposit only touches one wallet, we still lock
+     * that row with FOR UPDATE so concurrent deposits/transfers can't race.
      */
     async addMoney(userId: string, input: AddMoneyInput): Promise<WalletDto> {
         const amountMinor = toMinorUnits(input.amount);
 
-        const wallet = await withTransaction(async (client) => {
-            const locked = await client.query<WalletRow>(
-                `SELECT id, user_id, balance, created_at
-                 FROM wallets WHERE user_id = $1 FOR UPDATE`,
-                [userId]
-            );
-            const current = locked.rows[0];
-            if (!current) {
+        const wallet = await withTransaction(async (qr) => {
+            const walletRepo = qr.manager.getRepository(Wallet);
+            const txRepo = qr.manager.getRepository(Transaction);
+
+            const locked = await walletRepo
+                .createQueryBuilder('w')
+                .setLock('pessimistic_write')
+                .where('w.user_id = :userId', { userId })
+                .getOne();
+            if (!locked) {
                 throw ApiError.notFound('Wallet not found');
             }
 
-            const updated = await client.query<WalletRow>(
-                `UPDATE wallets
-                 SET balance = balance + $1
-                 WHERE id = $2
-                 RETURNING id, user_id, balance, created_at`,
-                [amountMinor.toString(), current.id]
-            );
+            locked.balance = (BigInt(locked.balance) + amountMinor).toString();
+            await walletRepo.save(locked);
 
-            await client.query(
-                `INSERT INTO transactions
-                    (sender_wallet_id, receiver_wallet_id, type, amount, status, description)
-                 VALUES (NULL, $1, 'DEPOSIT', $2, 'SUCCESS', $3)`,
-                [current.id, amountMinor.toString(), 'Wallet top-up']
-            );
+            const tx = txRepo.create({
+                senderWalletId: null,
+                receiverWalletId: locked.id,
+                type: 'DEPOSIT',
+                amount: amountMinor.toString(),
+                status: 'SUCCESS',
+                description: 'Wallet top-up',
+            });
+            await txRepo.save(tx);
 
-            return updated.rows[0];
+            return locked;
         });
 
         return toWalletDto(wallet);
@@ -71,13 +69,15 @@ export const walletService = {
     /**
      * Money transfer between two users.
      *
-     * Critical rules:
-     *   - Single PG transaction (BEGIN / COMMIT / ROLLBACK).
-     *   - Both wallets locked with SELECT ... FOR UPDATE.
-     *   - Lock order is deterministic (by wallet.id ASC) to prevent deadlocks
-     *     when two users transfer to each other simultaneously.
-     *   - All validation runs AFTER the locks are held to avoid TOCTOU bugs.
-     *   - On any failure, we ROLLBACK; the caller never sees a partial debit/credit.
+     * Concurrency-safe by design:
+     *   - Single PG transaction via QueryRunner (BEGIN / COMMIT / ROLLBACK).
+     *   - Both wallet rows are locked with SELECT ... FOR UPDATE
+     *     (TypeORM `setLock('pessimistic_write')`).
+     *   - The two wallet IDs are sorted ASC and locked in a single query, so
+     *     two users transferring to each other simultaneously can never
+     *     deadlock (deterministic lock order).
+     *   - Balance is validated *after* locks are held to avoid TOCTOU races.
+     *   - Any thrown error rolls back the entire transaction.
      */
     async transfer(
         senderUserId: string,
@@ -90,54 +90,46 @@ export const walletService = {
 
         const amountMinor = toMinorUnits(input.amount);
 
-        return withTransaction(async (client) => {
-            // 1. Resolve receiver (and their wallet) by email.
-            const receiverResult = await client.query<{
-                user_id: string;
-                wallet_id: string;
-                name: string;
-                email: string;
-            }>(
-                `SELECT u.id AS user_id, w.id AS wallet_id, u.name, u.email
-                 FROM users u
-                 JOIN wallets w ON w.user_id = u.id
-                 WHERE u.email = $1`,
-                [input.receiverEmail]
-            );
-            const receiver = receiverResult.rows[0];
-            if (!receiver) {
+        return withTransaction(async (qr) => {
+            const userRepo = qr.manager.getRepository(User);
+            const walletRepo = qr.manager.getRepository(Wallet);
+            const txRepo = qr.manager.getRepository(Transaction);
+
+            // 1. Resolve receiver (user + wallet) by email.
+            const receiver = await userRepo.findOne({
+                where: { email: input.receiverEmail },
+                relations: { wallet: true },
+            });
+            if (!receiver || !receiver.wallet) {
                 throw ApiError.notFound('Receiver not found');
             }
-
-            // Defence-in-depth: also block self-transfer by user id.
-            if (receiver.user_id === senderUserId) {
+            if (receiver.id === senderUserId) {
                 throw ApiError.badRequest('You cannot transfer money to yourself');
             }
 
-            // 2. Resolve sender wallet id (no lock yet — we lock both in order below).
-            const senderWalletResult = await client.query<{ id: string }>(
-                'SELECT id FROM wallets WHERE user_id = $1',
-                [senderUserId]
-            );
-            const senderWalletId = senderWalletResult.rows[0]?.id;
-            if (!senderWalletId) {
+            // 2. Resolve sender wallet id (no lock yet — we lock both below).
+            const senderWalletRow = await walletRepo.findOne({
+                where: { userId: senderUserId },
+                select: { id: true },
+            });
+            if (!senderWalletRow) {
                 throw ApiError.notFound('Sender wallet not found');
             }
 
-            // 3. Lock both wallets in a deterministic order to avoid deadlocks.
-            const [firstId, secondId] = [senderWalletId, receiver.wallet_id].sort();
-            const lockResult = await client.query<WalletRow>(
-                `SELECT id, user_id, balance, created_at
-                 FROM wallets
-                 WHERE id = ANY($1::uuid[])
-                 ORDER BY id
-                 FOR UPDATE`,
-                [[firstId, secondId]]
-            );
-            if (lockResult.rowCount !== 2) {
+            // 3. Lock both wallet rows in a deterministic order to avoid
+            //    deadlocks between concurrent transfers in opposite directions.
+            const orderedIds = [senderWalletRow.id, receiver.wallet.id].sort();
+            const lockedWallets = await walletRepo
+                .createQueryBuilder('w')
+                .setLock('pessimistic_write')
+                .where('w.id IN (:...ids)', { ids: orderedIds })
+                .orderBy('w.id', 'ASC')
+                .getMany();
+            if (lockedWallets.length !== 2) {
                 throw ApiError.internal('Failed to lock wallets for transfer');
             }
-            const senderWallet = lockResult.rows.find((r) => r.id === senderWalletId)!;
+            const senderWallet = lockedWallets.find((w) => w.id === senderWalletRow.id)!;
+            const receiverWallet = lockedWallets.find((w) => w.id === receiver.wallet!.id)!;
 
             // 4. Validate balance under lock.
             const senderBalance = BigInt(senderWallet.balance);
@@ -145,42 +137,28 @@ export const walletService = {
                 throw ApiError.badRequest('Insufficient balance');
             }
 
-            // 5. Debit sender.
-            const debit = await client.query<WalletRow>(
-                `UPDATE wallets
-                 SET balance = balance - $1
-                 WHERE id = $2
-                 RETURNING id, user_id, balance, created_at`,
-                [amountMinor.toString(), senderWalletId]
-            );
+            // 5. Debit sender + credit receiver.
+            senderWallet.balance = (senderBalance - amountMinor).toString();
+            receiverWallet.balance = (
+                BigInt(receiverWallet.balance) + amountMinor
+            ).toString();
+            await walletRepo.save([senderWallet, receiverWallet]);
 
-            // 6. Credit receiver.
-            await client.query(
-                `UPDATE wallets
-                 SET balance = balance + $1
-                 WHERE id = $2`,
-                [amountMinor.toString(), receiver.wallet_id]
-            );
+            // 6. Record the transfer.
+            const tx = txRepo.create({
+                senderWalletId: senderWallet.id,
+                receiverWalletId: receiverWallet.id,
+                type: 'TRANSFER',
+                amount: amountMinor.toString(),
+                status: 'SUCCESS',
+                description: input.description ?? null,
+            });
+            await txRepo.save(tx);
 
-            // 7. Insert transaction record.
-            const txResult = await client.query<{ id: string }>(
-                `INSERT INTO transactions
-                    (sender_wallet_id, receiver_wallet_id, type, amount, status, description)
-                 VALUES ($1, $2, 'TRANSFER', $3, 'SUCCESS', $4)
-                 RETURNING id`,
-                [
-                    senderWalletId,
-                    receiver.wallet_id,
-                    amountMinor.toString(),
-                    input.description ?? null,
-                ]
-            );
-
-            const updatedSender = debit.rows[0];
             return {
-                transactionId: txResult.rows[0].id,
-                senderBalance: fromMinorUnits(updatedSender.balance),
-                senderBalanceMinor: updatedSender.balance,
+                transactionId: tx.id,
+                senderBalance: fromMinorUnits(senderWallet.balance),
+                senderBalanceMinor: senderWallet.balance,
                 amount: input.amount,
                 receiverName: receiver.name,
                 receiverEmail: receiver.email,

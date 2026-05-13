@@ -1,19 +1,18 @@
+import 'reflect-metadata';
 import { createApp } from './app';
 import { env } from './config/env';
-import { pool } from './config/db';
+import { AppDataSource } from './config/data-source';
 
 async function bootstrap() {
-    const app = createApp();
-
-    // Lightweight DB liveness check; we keep the server up either way so the
-    // process is observable, but log a loud warning if the DB is unreachable.
     try {
-        await pool.query('SELECT 1');
-        console.log('PostgreSQL connection OK');
+        await AppDataSource.initialize();
+        console.log('PostgreSQL connection initialized (TypeORM DataSource)');
     } catch (err) {
-        console.error('PostgreSQL connection FAILED at startup:', err);
+        console.error('Failed to initialize DataSource:', err);
+        process.exit(1);
     }
 
+    const app = createApp();
     const server = app.listen(env.PORT, () => {
         console.log(`API running on http://localhost:${env.PORT}`);
         console.log(`Swagger UI at  http://localhost:${env.PORT}/api/docs`);
@@ -21,8 +20,13 @@ async function bootstrap() {
 
     const shutdown = (signal: string) => {
         console.log(`\nReceived ${signal}, shutting down gracefully...`);
-        server.close(() => {
-            pool.end().finally(() => process.exit(0));
+        server.close(async () => {
+            try {
+                if (AppDataSource.isInitialized) await AppDataSource.destroy();
+            } catch (err) {
+                console.error('Error during DataSource shutdown:', err);
+            }
+            process.exit(0);
         });
     };
     process.on('SIGINT', () => shutdown('SIGINT'));

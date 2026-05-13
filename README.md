@@ -2,10 +2,10 @@
 
 A full-stack wallet application that lets registered users hold a balance, add money, transfer money to other users, and review their full transaction history.
 
-- **Backend**: Node.js, Express, TypeScript, PostgreSQL (via `pg` raw SQL), JWT, bcrypt, Zod, Swagger.
-- **Frontend**: React + Vite + TypeScript, MUI, TanStack Query, React Router DOM, Axios.
+- **Backend**: Node.js, Express, TypeScript, PostgreSQL via **TypeORM**, JWT, bcrypt, Zod, Swagger.
+- **Frontend**: React + Vite + TypeScript, MUI, TanStack Query, React Router DOM, Axios, notistack.
 - **Database**: PostgreSQL (Supabase compatible). Money is stored as `BIGINT` in minor units (paise/cents) — never as floats.
-- **Transfers**: implemented inside a single PostgreSQL transaction with `SELECT … FOR UPDATE` row-locking on both wallets to guarantee consistency under concurrency.
+- **Transfers**: a single TypeORM transaction with `setLock('pessimistic_write')` (`SELECT … FOR UPDATE`) on both wallet rows to guarantee consistency under concurrency.
 
 ---
 
@@ -14,21 +14,27 @@ A full-stack wallet application that lets registered users hold a balance, add m
 ```
 .
 ├── backend/
-│   ├── db/schema.sql              # full SQL schema
 │   └── src/
-│       ├── config/                # env, db pool, swagger
+│       ├── config/
+│       │   ├── data-source.ts     # TypeORM DataSource + withTransaction helper
+│       │   ├── env.ts
+│       │   └── swagger.ts
+│       ├── entities/              # User, Wallet, Transaction (TypeORM entities)
 │       ├── middleware/            # auth, validate, error
+│       ├── migrations/            # TypeORM migrations
 │       ├── modules/
 │       │   ├── auth/              # register, login
 │       │   ├── wallet/            # balance, add-money, transfer
 │       │   └── transaction/       # history
+│       ├── scripts/migrate.ts     # runs TypeORM migrations
 │       ├── types/
 │       ├── utils/                 # ApiError, asyncHandler, jwt, money
-│       ├── app.ts                 # express app composition
-│       └── server.ts              # bootstrap
+│       ├── app.ts
+│       └── server.ts
 └── frontend/
     └── src/
-        ├── components/            # BalanceCard, TransactionsTable
+        ├── components/            # BalanceCard, TransactionsTable, StatCard, EmptyState,
+        │                          # StatusBadge, CurrencyInput, ConfirmDialog, UserAvatar, PasswordField
         ├── hooks/                 # useAuth, useWallet, useTransactions
         ├── layouts/               # AppLayout, AuthLayout
         ├── pages/                 # Login, Register, Dashboard, AddMoney, Transfer, TransactionHistory
@@ -37,6 +43,7 @@ A full-stack wallet application that lets registered users hold a balance, add m
         ├── store/                 # auth (localStorage)
         ├── types/                 # shared API types
         ├── utils/                 # formatting helpers
+        ├── theme.ts
         ├── App.tsx
         └── main.tsx
 ```
@@ -51,11 +58,11 @@ A full-stack wallet application that lets registered users hold a balance, add m
 
 ---
 
-## 1. Database setup (Supabase or any PostgreSQL)
+## 1. Database setup (via TypeORM migration)
 
 1. Create a project on Supabase. From **Project Settings → Database**, copy the **Connection String** (URI, with your password).
 2. Put that URI into `backend/.env` as `DATABASE_URL` (and set `DB_SSL=true` for Supabase).
-3. Apply the schema with the bundled migration script:
+3. Apply the schema with the TypeORM migration runner:
 
    ```bash
    cd backend
@@ -63,9 +70,15 @@ A full-stack wallet application that lets registered users hold a balance, add m
    npm run migrate
    ```
 
-   This runs [`backend/db/schema.sql`](backend/db/schema.sql) against your `DATABASE_URL` inside a single transaction, creating `users`, `wallets`, `transactions` and enabling `pgcrypto` for `gen_random_uuid()`. The schema uses `IF NOT EXISTS` guards, so the script is safe to re-run.
+   This runs the migrations in [`backend/src/migrations/`](backend/src/migrations) (currently `InitSchema1715600000000`) inside a single transaction, creating `users`, `wallets`, `transactions` and enabling `pgcrypto` for `gen_random_uuid()`. The migration uses `IF NOT EXISTS` guards and is tracked in a `typeorm_migrations` table, so it is safe to re-run.
 
-The schema in short:
+   To roll the last migration back:
+
+   ```bash
+   npm run migrate:revert
+   ```
+
+### Schema overview
 
 | Table | Key columns |
 | --- | --- |
@@ -81,7 +94,7 @@ The schema in short:
 cd backend
 cp .env.example .env       # fill in DATABASE_URL and JWT_SECRET
 npm install
-npm run migrate            # apply backend/db/schema.sql (idempotent)
+npm run migrate            # apply TypeORM migrations (idempotent)
 npm run dev                # http://localhost:4000
 ```
 
@@ -110,7 +123,8 @@ Once the server is running:
 | `npm run dev` | Start with `ts-node-dev` and hot reload |
 | `npm run build` | Compile TypeScript to `dist/` |
 | `npm start` | Run compiled `dist/server.js` |
-| `npm run migrate` | Apply `db/schema.sql` against `DATABASE_URL` |
+| `npm run migrate` | Apply pending TypeORM migrations |
+| `npm run migrate:revert` | Roll back the most recent migration |
 
 ---
 
@@ -144,7 +158,7 @@ npm run dev                # http://localhost:5173
 1. Open <http://localhost:5173>.
 2. Register two accounts (in two browsers, or one normal + one incognito).
 3. Sign in to the first account, click **Add money**, top up the wallet.
-4. Click **Transfer**, enter the second account's email, and send money.
+4. Click **Transfer**, enter the second account's email, review the confirmation, and send.
 5. Both accounts see the transaction on the **Transactions** page with sender, receiver, amount, status and date.
 
 ---
@@ -186,25 +200,24 @@ Full request/response schemas are available in **Swagger UI** at `/api/docs`.
 
 ## 6. Transfer logic — concurrency & consistency
 
-The transfer endpoint is the critical piece of the system. The flow inside `walletService.transfer` is:
+Implemented in [`wallet.service.ts`](backend/src/modules/wallet/wallet.service.ts) using a TypeORM `QueryRunner`:
 
-1. **Reject self-transfer by email**.
-2. **Open a single PG transaction** (`BEGIN`).
-3. **Resolve receiver** (user + wallet) by email.
+1. **Reject self-transfer by email** before opening the transaction.
+2. **`withTransaction`** opens a single PG transaction via `QueryRunner.startTransaction()`.
+3. **Resolve receiver** (user + wallet) by email using the transaction-bound manager.
 4. **Reject self-transfer by user id** (defence-in-depth).
-5. **Lock both wallets** with `SELECT … FOR UPDATE`, ordered by `wallet.id ASC`. The deterministic lock order is what prevents deadlocks when two users transfer to each other simultaneously.
-6. **Validate balance** *after* the locks are held (avoids TOCTOU races).
-7. **Debit sender**.
-8. **Credit receiver**.
-9. **Insert** the `transactions` row.
-10. **COMMIT**. On any thrown error, the wrapping `withTransaction` helper issues `ROLLBACK`, so the caller never sees a partial debit or credit.
+5. **Lock both wallet rows** in a single query with TypeORM's `setLock('pessimistic_write')` (`SELECT … FOR UPDATE`), ordered by `wallet.id ASC`. The deterministic lock order eliminates deadlocks when two users transfer to each other simultaneously.
+6. **Validate balance** *after* the locks are held to avoid TOCTOU races.
+7. **Debit sender + credit receiver** with `repo.save([sender, receiver])`.
+8. **Insert** the `transactions` row.
+9. **`commitTransaction()`**. Any thrown error triggers `rollbackTransaction()` in `withTransaction`'s `catch`, so callers never see a partial debit/credit.
 
-Money is stored as `BIGINT` minor units (paise/cents). The frontend submits amounts in major units (e.g. `100.50`) and the backend converts using `toMinorUnits` / `fromMinorUnits` (`backend/src/utils/money.ts`). The `wallets.balance` column has a `CHECK (balance >= 0)` constraint as a final guardrail.
+Money is stored as `BIGINT` minor units (paise/cents). The frontend submits amounts in major units (e.g. `100.50`) and the backend converts using `toMinorUnits` / `fromMinorUnits` ([`utils/money.ts`](backend/src/utils/money.ts)). The `wallets.balance` column has a `CHECK (balance >= 0)` constraint (`Check('balance_non_negative', ...)`) as a final guardrail.
 
 Validation rules enforced server-side:
 
 - Receiver must exist.
-- `amount > 0` and finite.
+- `amount > 0` and finite (Zod).
 - Sender ≠ receiver (by email **and** user id).
 - Sender's locked balance ≥ amount.
 
@@ -217,15 +230,32 @@ Validation rules enforced server-side:
 - Express hardened with `helmet` and `cors` (origin allowlist).
 - All request payloads validated by `Zod` schemas via the `validate` middleware before reaching controllers.
 - Centralized error handler returns consistent error JSON and hides internal details outside development.
-- Database access uses parameterized queries — no string concatenation, no ORM.
+- TypeORM uses parameterized queries everywhere — no string concatenation.
 
 ---
 
-## 8. Deliverables checklist
+## 8. UI/UX
+
+The frontend is built for clarity and to handle every edge case:
+
+- **Polished theme** with a modern fintech palette, custom shadows, Inter typography, soft radii.
+- **Two-column auth layout** with a hero panel (features) on the left and a focused form on the right.
+- **App shell** with a sticky topbar (frosted glass) and a left sidebar with active route highlighting and a footer user card with logout.
+- **Dashboard**: hero balance card (gradient + show/hide balance), three stat cards (received / sent / transfers), quick action cards, recent activity.
+- **Add money**: quick amount chips, currency input with `₹` prefix, live "balance after top-up" preview.
+- **Transfer**: currency input, real-time validation (self-transfer, insufficient balance, invalid amount), an inline "Add money" CTA when balance is short, and a **confirmation dialog** that previews recipient, amount, remaining balance, and note.
+- **Transaction history**: filter tabs (All / Received / Sent / Top-ups), pagination, responsive layout (table on desktop, cards on mobile), relative dates with hover tooltips showing the full date, status badges, avatar-based counterparty display.
+- **Loading & empty states**: skeletons match real content shape; empty states have a friendly icon, message and CTA.
+- **Errors**: shown both inline (Alert) and as toasts (notistack).
+- **Mobile**: drawer-based navigation, stacked layouts, card-based transaction list.
+
+---
+
+## 9. Deliverables checklist
 
 - [x] Source code (`backend/`, `frontend/`)
 - [x] README with setup instructions (this file)
-- [x] Database schema (`backend/db/schema.sql`)
+- [x] Database schema (TypeORM migration in [`backend/src/migrations/`](backend/src/migrations))
 - [x] API documentation (Swagger at `/api/docs`)
 - [x] Working frontend and backend
 - [x] `.env.example` for both apps

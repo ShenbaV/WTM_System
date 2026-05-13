@@ -8,6 +8,7 @@ import { env } from './config/env';
 import { swaggerSpec } from './config/swagger';
 
 import authRoutes from './modules/auth/auth.routes';
+import userRoutes from './modules/user/user.routes';
 import walletRoutes from './modules/wallet/wallet.routes';
 import transactionRoutes from './modules/transaction/transaction.routes';
 
@@ -41,6 +42,7 @@ export function createApp() {
 
     // API routes
     app.use('/api/auth', authRoutes);
+    app.use('/api/users', userRoutes);
     app.use('/api/wallet', walletRoutes);
     app.use('/api/transactions', transactionRoutes);
 
