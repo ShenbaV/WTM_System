@@ -1,12 +1,14 @@
 import path from 'path';
 import swaggerJsdoc from 'swagger-jsdoc';
-import { env } from './env';
 
 // __dirname is .../src/config in dev (ts-node-dev) and .../dist/config in prod.
 // Glob the sibling modules/ directory for both `.ts` and `.js` so JSDoc-driven
 // route specs are discovered in either mode.
 const modulesGlob = path.resolve(__dirname, '..', 'modules', '**', '*.routes.{ts,js}');
 
+// `servers` is intentionally omitted here — it's injected per request in app.ts
+// based on the incoming Host / X-Forwarded-* headers so the Swagger UI always
+// targets whatever URL the docs are being served from (localhost, Render, etc).
 export const swaggerSpec = swaggerJsdoc({
     definition: {
         openapi: '3.0.3',
@@ -18,7 +20,6 @@ export const swaggerSpec = swaggerJsdoc({
                 'Money amounts are accepted as major units (e.g. rupees) in HTTP payloads ' +
                 'and stored internally as BIGINT minor units (paise).',
         },
-        servers: [{ url: `http://localhost:${env.PORT}`, description: 'Local' }],
         components: {
             securitySchemes: {
                 bearerAuth: {

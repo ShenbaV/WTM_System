@@ -14,8 +14,27 @@ import transactionRoutes from './modules/transaction/transaction.routes';
 
 import { errorHandler, notFoundHandler } from './middleware/error.middleware';
 
+/**
+ * Derive the public base URL of the API from the incoming request, honouring
+ * the X-Forwarded-* headers that proxies (Render, Heroku, etc.) inject.
+ * Falls back to the request's own protocol/host for direct local access.
+ */
+function publicBaseUrl(req: Request): string {
+    const forwardedProto = String(req.headers['x-forwarded-proto'] ?? '')
+        .split(',')[0]
+        .trim();
+    const proto = forwardedProto || req.protocol || 'http';
+    const host = String(
+        req.headers['x-forwarded-host'] ?? req.headers.host ?? ''
+    ).trim();
+    return host ? `${proto}://${host}` : '';
+}
+
 export function createApp() {
     const app = express();
+
+    // Required so req.protocol respects X-Forwarded-Proto on Render et al.
+    app.set('trust proxy', true);
 
     app.use(helmet());
     app.use(
@@ -33,12 +52,27 @@ export function createApp() {
     });
 
     // API docs
+    //
+    // /api/docs.json is rebuilt per request so the `servers` block always
+    // points at the actual host serving the docs (localhost in dev, the
+    // Render URL in production, a custom domain, etc.).
+    app.get('/api/docs.json', (req, res) => {
+        const url = publicBaseUrl(req);
+        res.json({
+            ...(swaggerSpec as object),
+            servers: url ? [{ url, description: 'Current host' }] : [],
+        });
+    });
     app.use(
         '/api/docs',
         swaggerUi.serve,
-        swaggerUi.setup(swaggerSpec, { explorer: true })
+        swaggerUi.setup(undefined, {
+            explorer: true,
+            // Point Swagger UI at the dynamic JSON above so it picks up
+            // whatever server URL is correct for this host.
+            swaggerOptions: { url: '/api/docs.json' },
+        })
     );
-    app.get('/api/docs.json', (_req, res) => res.json(swaggerSpec));
 
     // API routes
     app.use('/api/auth', authRoutes);
