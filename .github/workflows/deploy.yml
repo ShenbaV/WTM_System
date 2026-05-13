@@ -34,8 +34,7 @@ jobs:
 
       - name: Compile Production Build
         env:
-          VITE_API_URL: ${{ secrets.VITE_API_URL }}
-          VITE_ANALYTICS_ID: ${{ secrets.VITE_ANALYTICS_ID }}
+          VITE_API_BASE_URL: ${{ secrets.VITE_API_BASE_URL }}
         run: npx vite build 
 
       - name: Deploy Compiled Files to GitHub Pages
