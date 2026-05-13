@@ -166,14 +166,7 @@ export default function AuthLayout() {
                                 <Outlet />
                             </Box>
                         </Stack>
-                    </Paper>
-
-                    <Typography
-                        variant="caption"
-                        sx={{ color: 'rgba(255,255,255,0.85)', textAlign: 'center' }}
-                    >
-                        Protected by JWT • bcrypt-hashed passwords • PostgreSQL row locks
-                    </Typography>
+                    </Paper>     
                 </Stack>
             </Container>
         </Box>
