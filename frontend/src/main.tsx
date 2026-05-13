@@ -27,7 +27,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
                 autoHideDuration={4000}
             >
                 <QueryClientProvider client={queryClient}>
-                    <BrowserRouter>
+                    <BrowserRouter basename={import.meta.env.BASE_URL}>
                         <App />
                     </BrowserRouter>
                 </QueryClientProvider>

@@ -19,16 +19,22 @@ api.interceptors.request.use((config: InternalAxiosRequestConfig) => {
 
 // 401 handling: clear stored session and bounce to /login (the route guard
 // re-renders on the next render cycle once the token is gone).
+// We prefix paths with import.meta.env.BASE_URL so this works both at the
+// dev server root ('/') and behind a GitHub Pages sub-path (e.g. '/WTM_System/').
+const basePrefix = import.meta.env.BASE_URL.replace(/\/$/, '');
+const loginPath = `${basePrefix}/login`;
+const registerPath = `${basePrefix}/register`;
+
 api.interceptors.response.use(
     (res) => res,
     (error: AxiosError) => {
         if (error.response?.status === 401) {
-            const onLoginPage =
-                window.location.pathname === '/login' ||
-                window.location.pathname === '/register';
-            if (!onLoginPage) {
+            const onAuthPage =
+                window.location.pathname === loginPath ||
+                window.location.pathname === registerPath;
+            if (!onAuthPage) {
                 authStore.clear();
-                window.location.assign('/login');
+                window.location.assign(loginPath);
             }
         }
         return Promise.reject(error);
